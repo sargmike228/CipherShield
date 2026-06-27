@@ -1,0 +1,8 @@
+{
+  "name": "CipherShield: Многослойный Шифратор",
+  "description": "Ультимативное приложение для шифрования текста и файлов с 7 слоями защиты: 3 алгоритма шифрования, 2 XOR-генератора шума и 2 цифровые подписи.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
