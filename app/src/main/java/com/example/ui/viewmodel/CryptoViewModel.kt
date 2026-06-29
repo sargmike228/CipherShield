@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.audio.RetroSoundGenerator
 import com.example.crypto.MultiLayerCrypto
+import com.example.crypto.PgpCrypto
 import com.example.data.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
@@ -59,6 +60,20 @@ class CryptoViewModel(application: Application) : AndroidViewModel(application) 
     // Operation loading state
     private val _isProcessing = MutableStateFlow(false)
     val isProcessing: StateFlow<Boolean> = _isProcessing.asStateFlow()
+
+    // PGP States
+    val pgpPublicKeyPem = MutableStateFlow("")
+    val pgpPrivateKeyPem = MutableStateFlow("")
+    val pgpSignatureResult = MutableStateFlow("")
+    val pgpSignatureVerifyInput = MutableStateFlow("")
+    val pgpVerificationStatus = MutableStateFlow("")
+
+    // Hashing / HMAC States
+    val hashingAlgorithm = MutableStateFlow("SHA-256")
+    val hashingKey = MutableStateFlow("")
+    val hashingInput = MutableStateFlow("")
+    val hashingOutput = MutableStateFlow("")
+    val isHmacEnabled = MutableStateFlow(false)
 
     init {
         // Load initial sandbox files from filesDir to database to sync
@@ -572,6 +587,548 @@ class CryptoViewModel(application: Application) : AndroidViewModel(application) 
 
         override fun onLog(message: String) {
             logToConsole(message)
+        }
+    }
+
+    // ==========================================
+    // PGP (RSA) ASYMMETRIC CRYPTOGRAPHY METHODS
+    // ==========================================
+
+    fun generatePgpKeys(name: String, keySize: Int = 2048) {
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ Запуск генерации PGP-ключей (RSA-$keySize) для идентификатора: $name...")
+            RetroSoundGenerator.playDiceRoll()
+
+            try {
+                val keyPair = withContext(Dispatchers.Default) {
+                    PgpCrypto.generateRsaKeyPair(keySize)
+                }
+
+                val pubPem = PgpCrypto.publicKeyToPem(keyPair.public)
+                val privPem = PgpCrypto.privateKeyToPem(keyPair.private)
+
+                pgpPublicKeyPem.value = pubPem
+                pgpPrivateKeyPem.value = privPem
+
+                // Save to workspace safe so user can copy/export/manage them!
+                val cleanName = name.replace(Regex("[^a-zA-Z0-9_-]"), "_").ifEmpty { "pgp_key" }
+                createTextFileInWorkspace("${cleanName}_pub.pem", pubPem)
+                createTextFileInWorkspace("${cleanName}_priv.pem", privPem)
+
+                logToConsole("✅ Генерация PGP-ключей завершена. Файлы ${cleanName}_pub.pem и ${cleanName}_priv.pem сохранены в Сейф.")
+                RetroSoundGenerator.playHeal()
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = "${cleanName} RSA Key Pair",
+                        operation = "Генерация PGP ключей",
+                        sizeBytes = (pubPem.length + privPem.length).toLong(),
+                        success = true,
+                        details = "Успешно сгенерирована пара асимметричных ключей RSA-$keySize."
+                    )
+                )
+            } catch (e: Exception) {
+                logToConsole("❌ Ошибка генерации ключей: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    fun encryptTextPgp() {
+        val pubKeyPem = pgpPublicKeyPem.value.trim()
+        if (pubKeyPem.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Введите или загрузите PGP Публичный ключ (Public Key)!")
+            return
+        }
+        val textToEncrypt = inputText.value
+        if (textToEncrypt.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Исходный текст пуст!")
+            return
+        }
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ PGP: Шифрование текста с помощью RSA Public Key...")
+            try {
+                val pubKey = PgpCrypto.pemToPublicKey(pubKeyPem)
+                val plainBytes = textToEncrypt.toByteArray(Charsets.UTF_8)
+                val cipherBytes = withContext(Dispatchers.Default) {
+                    PgpCrypto.encryptWithPublicKey(plainBytes, pubKey)
+                }
+
+                val base64Output = Base64.encodeToString(cipherBytes, Base64.DEFAULT)
+                outputText.value = base64Output
+                logToConsole("✅ PGP: Шифрование успешно завершено.")
+                RetroSoundGenerator.playHeal()
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = "PGP Text Encryption",
+                        operation = "PGP Шифрование",
+                        sizeBytes = plainBytes.size.toLong(),
+                        success = true,
+                        details = "Асимметричное RSA шифрование публичным ключом."
+                    )
+                )
+            } catch (e: Exception) {
+                logToConsole("❌ PGP Ошибка шифрования: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    fun decryptTextPgp() {
+        val privKeyPem = pgpPrivateKeyPem.value.trim()
+        if (privKeyPem.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Введите или загрузите PGP Приватный ключ (Private Key)!")
+            return
+        }
+        val textToDecrypt = inputText.value.trim()
+        if (textToDecrypt.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Входной зашифрованный текст пуст!")
+            return
+        }
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ PGP: Расшифрование текста с помощью RSA Private Key...")
+            try {
+                val privKey = PgpCrypto.pemToPrivateKey(privKeyPem)
+                val cipherBytes = Base64.decode(textToDecrypt, Base64.DEFAULT)
+                val plainBytes = withContext(Dispatchers.Default) {
+                    PgpCrypto.decryptWithPrivateKey(cipherBytes, privKey)
+                }
+
+                val restoredText = String(plainBytes, Charsets.UTF_8)
+                outputText.value = restoredText
+                logToConsole("✅ PGP: Расшифрование успешно завершено. Текст восстановлен.")
+                RetroSoundGenerator.playHeal()
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = "PGP Text Decryption",
+                        operation = "PGP Дешифрование",
+                        sizeBytes = cipherBytes.size.toLong(),
+                        success = true,
+                        details = "Асимметричное RSA дешифрование приватным ключом."
+                    )
+                )
+            } catch (e: Exception) {
+                logToConsole("❌ PGP Ошибка дешифрования: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    fun signTextPgp() {
+        val privKeyPem = pgpPrivateKeyPem.value.trim()
+        if (privKeyPem.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Введите или загрузите PGP Приватный ключ для создания подписи!")
+            return
+        }
+        val textToSign = inputText.value
+        if (textToSign.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Исходный текст пуст!")
+            return
+        }
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ PGP: Создание цифровой подписи (Signature) с помощью RSA Private Key...")
+            try {
+                val privKey = PgpCrypto.pemToPrivateKey(privKeyPem)
+                val dataBytes = textToSign.toByteArray(Charsets.UTF_8)
+                val signatureBytes = withContext(Dispatchers.Default) {
+                    PgpCrypto.signWithPrivateKey(dataBytes, privKey)
+                }
+
+                val base64Sig = Base64.encodeToString(signatureBytes, Base64.DEFAULT)
+                pgpSignatureResult.value = base64Sig
+                logToConsole("✅ PGP: Подпись успешно создана и помещена в буфер!")
+                RetroSoundGenerator.playHeal()
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = "PGP Text Sign",
+                        operation = "PGP Подпись",
+                        sizeBytes = dataBytes.size.toLong(),
+                        success = true,
+                        details = "Цифровая подпись SHA256withRSA приватным ключом."
+                    )
+                )
+            } catch (e: Exception) {
+                logToConsole("❌ PGP Ошибка подписи: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    fun verifyTextPgp() {
+        val pubKeyPem = pgpPublicKeyPem.value.trim()
+        if (pubKeyPem.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Введите или загрузите PGP Публичный ключ для проверки подписи!")
+            return
+        }
+        val textToVerify = inputText.value
+        val signatureBase64 = pgpSignatureVerifyInput.value.trim()
+        if (signatureBase64.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Введите подпись для проверки!")
+            return
+        }
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ PGP: Верификация цифровой подписи с помощью RSA Public Key...")
+            try {
+                val pubKey = PgpCrypto.pemToPublicKey(pubKeyPem)
+                val dataBytes = textToVerify.toByteArray(Charsets.UTF_8)
+                val signatureBytes = Base64.decode(signatureBase64, Base64.DEFAULT)
+
+                val verified = withContext(Dispatchers.Default) {
+                    PgpCrypto.verifyWithPublicKey(dataBytes, signatureBytes, pubKey)
+                }
+
+                if (verified) {
+                    pgpVerificationStatus.value = "SUCCESS"
+                    logToConsole("✅ PGP: ВЕРИФИКАЦИЯ УСПЕШНА! Подпись подлинная, текст не изменялся.")
+                    RetroSoundGenerator.playHeal()
+                } else {
+                    pgpVerificationStatus.value = "FAILED"
+                    logToConsole("❌ PGP: ВЕРИФИКАЦИЯ ПРОВАЛЕНА! Неверная подпись или измененный текст.")
+                    RetroSoundGenerator.playDamage()
+                }
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = "PGP Text Verification",
+                        operation = "PGP Верификация",
+                        sizeBytes = dataBytes.size.toLong(),
+                        success = verified,
+                        details = "Проверка цифровой подписи SHA256withRSA. Статус: $verified."
+                    )
+                )
+            } catch (e: Exception) {
+                pgpVerificationStatus.value = "ERROR"
+                logToConsole("❌ PGP Ошибка верификации: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    fun encryptFilePgp(fileItem: SecureFileItem) {
+        val pubKeyPem = pgpPublicKeyPem.value.trim()
+        if (pubKeyPem.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Введите или загрузите PGP Публичный ключ!")
+            return
+        }
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ PGP: Асимметричное шифрование файла: ${fileItem.originalName}...")
+            RetroSoundGenerator.playDiceRoll()
+
+            try {
+                val pubKey = PgpCrypto.pemToPublicKey(pubKeyPem)
+                val targetFile = File(context.filesDir, fileItem.virtualPath)
+                if (!targetFile.exists()) {
+                    throw java.io.FileNotFoundException("Файл не найден во внутреннем хранилище.")
+                }
+
+                val fileBytes = withContext(Dispatchers.IO) { targetFile.readBytes() }
+                val encryptedBytes = withContext(Dispatchers.Default) {
+                    PgpCrypto.encryptWithPublicKey(fileBytes, pubKey)
+                }
+
+                val encVirtualPath = "${UUID.randomUUID()}.pgp.enc"
+                val encFile = File(context.filesDir, encVirtualPath)
+                withContext(Dispatchers.IO) { encFile.writeBytes(encryptedBytes) }
+
+                val encryptedFileItem = SecureFileItem(
+                    originalName = "${fileItem.originalName}.pgp.enc",
+                    virtualPath = encVirtualPath,
+                    isEncrypted = true,
+                    sizeBytes = encryptedBytes.size.toLong()
+                )
+                repository.insertFile(encryptedFileItem)
+
+                logToConsole("✅ PGP: Файл зашифрован успешно! Создан PGP-контейнер: ${encryptedFileItem.originalName}")
+                RetroSoundGenerator.playHeal()
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = fileItem.originalName,
+                        operation = "PGP Шифрование файла",
+                        sizeBytes = fileBytes.size.toLong(),
+                        success = true,
+                        details = "Файл зашифрован RSA открытым ключом. Контейнер: ${encryptedBytes.size} байт."
+                    )
+                )
+            } catch (e: Exception) {
+                logToConsole("❌ PGP Ошибка шифрования файла: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    fun decryptFilePgp(fileItem: SecureFileItem) {
+        val privKeyPem = pgpPrivateKeyPem.value.trim()
+        if (privKeyPem.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Введите или загрузите PGP Приватный ключ!")
+            return
+        }
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ PGP: Асимметричное расшифрование файла: ${fileItem.originalName}...")
+            RetroSoundGenerator.playDiceRoll()
+
+            try {
+                val privKey = PgpCrypto.pemToPrivateKey(privKeyPem)
+                val targetFile = File(context.filesDir, fileItem.virtualPath)
+                if (!targetFile.exists()) {
+                    throw java.io.FileNotFoundException("Файл не найден.")
+                }
+
+                val encBytes = withContext(Dispatchers.IO) { targetFile.readBytes() }
+                val decryptedBytes = withContext(Dispatchers.Default) {
+                    PgpCrypto.decryptWithPrivateKey(encBytes, privKey)
+                }
+
+                val decName = fileItem.originalName.removeSuffix(".pgp.enc").let {
+                    if (it == fileItem.originalName) "$it.dec" else it
+                }
+                val decVirtualPath = UUID.randomUUID().toString()
+                val decFile = File(context.filesDir, decVirtualPath)
+                withContext(Dispatchers.IO) { decFile.writeBytes(decryptedBytes) }
+
+                val decryptedFileItem = SecureFileItem(
+                    originalName = decName,
+                    virtualPath = decVirtualPath,
+                    isEncrypted = false,
+                    sizeBytes = decryptedBytes.size.toLong()
+                )
+                repository.insertFile(decryptedFileItem)
+
+                logToConsole("✅ PGP: Файл расшифрован успешно! Восстановлен файл: $decName")
+                RetroSoundGenerator.playHeal()
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = fileItem.originalName,
+                        operation = "PGP Расшифрование файла",
+                        sizeBytes = encBytes.size.toLong(),
+                        success = true,
+                        details = "Файл успешно расшифрован RSA приватным ключом. Размер: ${decryptedBytes.size} байт."
+                    )
+                )
+            } catch (e: Exception) {
+                logToConsole("❌ PGP Ошибка дешифрования файла: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    fun signFilePgp(fileItem: SecureFileItem) {
+        val privKeyPem = pgpPrivateKeyPem.value.trim()
+        if (privKeyPem.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Загрузите PGP Приватный ключ!")
+            return
+        }
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ PGP: Создание цифровой подписи для файла: ${fileItem.originalName}...")
+            try {
+                val privKey = PgpCrypto.pemToPrivateKey(privKeyPem)
+                val targetFile = File(context.filesDir, fileItem.virtualPath)
+                val fileBytes = withContext(Dispatchers.IO) { targetFile.readBytes() }
+
+                val signatureBytes = withContext(Dispatchers.Default) {
+                    PgpCrypto.signWithPrivateKey(fileBytes, privKey)
+                }
+
+                val base64Sig = Base64.encodeToString(signatureBytes, Base64.DEFAULT)
+                pgpSignatureResult.value = base64Sig
+                logToConsole("✅ PGP: Подпись для файла создана.")
+                RetroSoundGenerator.playHeal()
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = fileItem.originalName,
+                        operation = "PGP Подпись файла",
+                        sizeBytes = fileBytes.size.toLong(),
+                        success = true,
+                        details = "Файл подписан SHA256withRSA. Подпись сгенерирована."
+                    )
+                )
+            } catch (e: Exception) {
+                logToConsole("❌ PGP Ошибка подписи файла: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    fun verifyFilePgp(fileItem: SecureFileItem) {
+        val pubKeyPem = pgpPublicKeyPem.value.trim()
+        if (pubKeyPem.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Загрузите PGP Публичный ключ!")
+            return
+        }
+        val sigBase64 = pgpSignatureVerifyInput.value.trim()
+        if (sigBase64.isEmpty()) {
+            logToConsole("⚠️ Ошибка: Введите подпись для проверки файла!")
+            return
+        }
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ PGP: Верификация подписи для файла: ${fileItem.originalName}...")
+            try {
+                val pubKey = PgpCrypto.pemToPublicKey(pubKeyPem)
+                val targetFile = File(context.filesDir, fileItem.virtualPath)
+                val fileBytes = withContext(Dispatchers.IO) { targetFile.readBytes() }
+                val signatureBytes = Base64.decode(sigBase64, Base64.DEFAULT)
+
+                val verified = withContext(Dispatchers.Default) {
+                    PgpCrypto.verifyWithPublicKey(fileBytes, signatureBytes, pubKey)
+                }
+
+                if (verified) {
+                    pgpVerificationStatus.value = "SUCCESS"
+                    logToConsole("✅ PGP: ФАЙЛ ПОДЛИННЫЙ! Цифровая подпись успешно подтверждена.")
+                    RetroSoundGenerator.playHeal()
+                } else {
+                    pgpVerificationStatus.value = "FAILED"
+                    logToConsole("❌ PGP: ФАЙЛ МОДИФИЦИРОВАН или неверная подпись!")
+                    RetroSoundGenerator.playDamage()
+                }
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = fileItem.originalName,
+                        operation = "PGP Проверка файла",
+                        sizeBytes = fileBytes.size.toLong(),
+                        success = verified,
+                        details = "Проверка цифровой подписи файла SHA256withRSA. Результат: $verified."
+                    )
+                )
+            } catch (e: Exception) {
+                pgpVerificationStatus.value = "ERROR"
+                logToConsole("❌ PGP Ошибка проверки файла: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    // ==========================================
+    // MULTI-FUNCTIONAL HASHING & HMAC ENGINE
+    // ==========================================
+
+    fun calculateHashing(textOnly: Boolean, selectedFile: SecureFileItem? = null) {
+        val algo = hashingAlgorithm.value
+        val isHmac = isHmacEnabled.value
+        val keyString = hashingKey.value
+        val textInputBytes = hashingInput.value.toByteArray(Charsets.UTF_8)
+
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("⚡ Запуск хэширования [$algo] (HMAC=$isHmac)...")
+            try {
+                val bytesToHash = if (textOnly) {
+                    textInputBytes
+                } else {
+                    if (selectedFile == null) {
+                        throw IllegalArgumentException("Файл не выбран!")
+                    }
+                    val targetFile = File(context.filesDir, selectedFile.virtualPath)
+                    withContext(Dispatchers.IO) { targetFile.readBytes() }
+                }
+
+                val hashedBytes = withContext(Dispatchers.Default) {
+                    if (isHmac) {
+                        val javaAlgoName = when (algo) {
+                            "SHA-256" -> "HmacSHA256"
+                            "SHA-512" -> "HmacSHA512"
+                            "MD5" -> "HmacMD5"
+                            "SHA-1" -> "HmacSHA1"
+                            else -> "HmacSHA256"
+                        }
+                        PgpCrypto.calculateHmac(bytesToHash, keyString.toByteArray(Charsets.UTF_8), javaAlgoName)
+                    } else {
+                        PgpCrypto.calculateHash(bytesToHash, algo)
+                    }
+                }
+
+                val hexString = PgpCrypto.bytesToHex(hashedBytes)
+                hashingOutput.value = hexString
+                logToConsole("✅ Хэш успешно вычислен: $hexString")
+                RetroSoundGenerator.playHeal()
+
+                repository.insertHistory(
+                    CryptoHistory(
+                        sourceName = if (textOnly) "Введенный текст" else selectedFile?.originalName ?: "Файл",
+                        operation = if (isHmac) "HMAC-$algo" else algo,
+                        sizeBytes = bytesToHash.size.toLong(),
+                        success = true,
+                        details = "Хэш-сумма: ${hexString.take(16)}..."
+                    )
+                )
+            } catch (e: Exception) {
+                logToConsole("❌ Ошибка хэширования: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
+        }
+    }
+
+    fun exportFileToDownloads(fileItem: SecureFileItem) {
+        viewModelScope.launch {
+            _isProcessing.value = true
+            logToConsole("📤 Экспорт файла в папку Загрузки (Downloads)...")
+            try {
+                val sourceFile = File(context.filesDir, fileItem.virtualPath)
+                if (!sourceFile.exists()) {
+                    throw java.io.FileNotFoundException("Файл не найден во внутреннем сейфе.")
+                }
+
+                val targetDir = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS)
+                if (!targetDir.exists()) {
+                    targetDir.mkdirs()
+                }
+
+                val targetFile = File(targetDir, fileItem.originalName)
+                withContext(Dispatchers.IO) {
+                    sourceFile.copyTo(targetFile, overwrite = true)
+                }
+
+                logToConsole("✅ Файл экспортирован успешно! Сохранен в: ${targetFile.absolutePath}")
+                RetroSoundGenerator.playHeal()
+            } catch (e: Exception) {
+                logToConsole("❌ Ошибка экспорта файла: ${e.message}")
+                RetroSoundGenerator.playDamage()
+            } finally {
+                _isProcessing.value = false
+            }
         }
     }
 }
